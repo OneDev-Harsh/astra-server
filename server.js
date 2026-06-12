@@ -4,7 +4,9 @@
 // - Bootstrap endpoint: one-time key exchange during setup
 // - HMAC request signing: all authenticated requests must include
 //   a timestamp + HMAC signature to prevent replay attacks
-// - Loopback-only binding: server never listens on external interfaces
+// - Configurable CORS: allowed origins set via ALLOWED_ORIGINS env var
+// - Trust proxy: safe behind Render's reverse proxy
+// - Helmet: security headers (HSTS, CSP, etc.)
 // - No server version headers leak
 // - Rate limiting on all endpoints
 // - Minimal attack surface: only 3 routes
@@ -13,6 +15,7 @@ import dotenv from "dotenv";
 dotenv.config();
 import express from "express";
 import rateLimit from "express-rate-limit";
+import helmet from "helmet";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import fs from "fs";
 import path from "path";
@@ -23,29 +26,77 @@ const app = express();
 // ── Strip version headers ──────────────────────────────────────────────────
 app.disable("x-powered-by");
 
+// ── Trust proxy (Render / reverse proxy) ──────────────────────────────────
+// Render routes traffic through a reverse proxy. Without this,
+// req.ip would be the proxy's IP and rate-limiting / HTTPS detection breaks.
+app.set("trust proxy", 1);
+
+// ── Helmet: security headers ──────────────────────────────────────────────
+// Sets HSTS, CSP, X-Content-Type-Options, etc.
+app.use(helmet({
+  // Allow the health check to be fetched by Render's health probes
+  // and any monitoring tools without strict CSP blocking them.
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+}));
+
 // ── JSON body parser with strict limit ─────────────────────────────────────
 app.use(express.json({ limit: "1kb" }));
 
-// ── CORS: localhost only ───────────────────────────────────────────────────
+// ── CORS: configurable allowed origins ─────────────────────────────────────
+// On localhost-only setups this defaults to localhost.
+// On Render (or any public host), set ALLOWED_ORIGINS env var to a
+// comma-separated list of allowed origins, e.g.:
+//   ALLOWED_ORIGINS=https://my-app.onrender.com,https://my-app.com
+const DEFAULT_LOCAL_ORIGINS = [
+  "http://localhost",
+  "http://127.0.0.1",
+  "http://[::1]",
+];
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+// If no explicit origins are configured, fall back to localhost defaults.
+// This keeps the existing local-dev behaviour intact.
+const effectiveOrigins = allowedOrigins.length > 0
+  ? allowedOrigins
+  : DEFAULT_LOCAL_ORIGINS;
+
+// Build a set of allowed origin prefixes for quick lookup.
+// We compare the full origin string (scheme + host + port).
+const allowedOriginSet = new Set(effectiveOrigins);
+
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+
   if (origin) {
-    try {
-      const url = new URL(origin);
-      if (
-        url.hostname !== "localhost" &&
-        url.hostname !== "127.0.0.1" &&
-        url.hostname !== "::1"
-      ) {
-        return res.status(403).json({ error: "Origin not allowed" });
-      }
+    // Exact match against the allowed set
+    if (allowedOriginSet.has(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
-    } catch {
-      return res.status(400).json({ error: "Invalid origin header" });
+    } else {
+      // Also check if the origin's base (without trailing slash) matches
+      // any allowed origin — handles cases like "http://localhost:3000"
+      // when "http://localhost" is in the allowed list.
+      try {
+        const url = new URL(origin);
+        const originBase = `${url.protocol}//${url.host}`;
+        if (allowedOriginSet.has(originBase)) {
+          res.setHeader("Access-Control-Allow-Origin", origin);
+        } else {
+          return res.status(403).json({ error: "Origin not allowed" });
+        }
+      } catch {
+        return res.status(400).json({ error: "Invalid origin header" });
+      }
     }
   } else {
-    res.setHeader("Access-Control-Allow-Origin", "http://127.0.0.1");
+    // No origin header (e.g. server-to-server, curl) — set a safe default
+    res.setHeader("Access-Control-Allow-Origin", effectiveOrigins[0]);
   }
+
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Timestamp, X-Signature");
   res.setHeader("Access-Control-Max-Age", "600");
@@ -125,7 +176,10 @@ const activeTokens = new Set();
 
 // ── HMAC Signing Secret ───────────────────────────────────────────────────
 // Persisted to disk so server restarts don't invalidate CLI credentials.
-const STATE_DIR = path.join(os.homedir(), ".astra", ".server");
+// On Render, use /tmp or a mounted volume; locally, use ~/.astra/.server.
+const STATE_DIR = process.env.STATE_DIR
+  ? path.resolve(process.env.STATE_DIR)
+  : path.join(os.homedir(), ".astra", ".server");
 const STATE_FILE = path.join(STATE_DIR, "server-state.json");
 
 let SIGNING_SECRET;
@@ -309,9 +363,17 @@ app.use((err, req, _res, _next) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT, 10) || 3000;
-const server = app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Sandbox key server listening on 127.0.0.1:${PORT}`);
+const PORT = parseInt(process.env.PORT, 10);
+if (isNaN(PORT) || PORT <= 0) {
+  console.error("PORT must be a valid positive integer. Got:", process.env.PORT);
+  process.exit(1);
+}
+
+// Bind to 0.0.0.0 so Render (and any container platform) can reach us.
+// Previously this was 127.0.0.1 (loopback-only), which only works locally.
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Sandbox key server listening on 0.0.0.0:${PORT}`);
+  console.log(`Allowed origins: ${effectiveOrigins.join(", ")}`);
 });
 
 // ── Graceful Shutdown ──────────────────────────────────────────────────────
